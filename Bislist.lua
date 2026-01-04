@@ -61,11 +61,415 @@ local searchText = ""
 local searchTextLower = ""
 local showOnlyMissing = false
 
+local bisChecklistMode = false -- "BIS checklist" mode (hide completed BIS slots + show sources + targets summary)
+local checklistSummaryLabel = nil
+local drawSpecData -- forward declaration (called by preloader before definition)
+
 -- Owned info helper (cache from Core.lua)
 local function GetOwnedRow(item_id)
     local t = _G.Bistooltip_char_equipment
     if not t then return nil end
     return t[item_id]
+end
+
+-- Checklist-mode helpers
+
+local function OwnedCount(item_id)
+    local row = GetOwnedRow(item_id)
+    if not row then return 0 end
+    return (row.bags or 0) + (row.equipped or 0)
+end
+
+local function NormalizeItemID(original_item_id)
+    if not original_item_id or original_item_id <= 0 then return nil end
+    if _G.Bistooltip_horde_to_ali and _G.Bistooltip_horde_to_ali[original_item_id] then
+        return _G.Bistooltip_horde_to_ali[original_item_id]
+    end
+    return original_item_id
+end
+
+local function IsDualSlot(slot, item_id)
+    -- Prefer equipLoc when cached; fallback to slot name hints
+    local equipLoc
+    if item_id then
+        local _, _, _, _, _, _, _, _, loc = GetItemInfo(item_id)
+        equipLoc = loc
+    end
+    if equipLoc == "INVTYPE_TRINKET" or equipLoc == "INVTYPE_FINGER" then
+        return true
+    end
+    local sn = slot and (slot.slot_name or slot.name)
+    if sn then
+        sn = tostring(sn):lower()
+        if sn:find("trinket") or sn:find("ring") or sn:find("finger") then
+            return true
+        end
+    end
+    return false
+end
+
+local function GetRequiredBISItemsForSlot(slot)
+    local req = {}
+    local a = NormalizeItemID(slot and slot[1])
+    if a then table.insert(req, a) end
+
+    if a and IsDualSlot(slot, a) then
+        local b = NormalizeItemID(slot and slot[2])
+        if b and b ~= a then
+            table.insert(req, b)
+        else
+            -- If BIS1 == BIS2 (or missing), pick the next distinct item from the row as BIS2.
+            local found
+            for i = 2, math.min(#slot, 6) do
+                local cand = NormalizeItemID(slot[i])
+                if cand and cand ~= a then
+                    found = cand
+                    break
+                end
+            end
+            if found then
+                table.insert(req, found)
+            end
+        end
+    end
+    return req
+end
+
+local function SlotBISCompleted(slot)
+    local req = GetRequiredBISItemsForSlot(slot)
+    if #req == 0 then return false end
+
+    if #req == 1 then
+        return OwnedCount(req[1]) >= 1
+    end
+
+    -- Dual-slot completion: need BOTH BIS items (distinct).
+    -- If the row contains only one distinct BIS item, treat as single requirement.
+    if req[1] == req[2] then
+        return OwnedCount(req[1]) >= 1
+    end
+    return OwnedCount(req[1]) >= 1 and OwnedCount(req[2]) >= 1
+end
+
+local function GetSourceShort(item_id)
+    -- Legacy compact helper (zone + boss)
+    if not item_id or item_id <= 0 then return "" end
+    if _G.BistooltipAddon and _G.BistooltipAddon.GetItemSourceInfo then
+        local zone, boss = _G.BistooltipAddon:GetItemSourceInfo(item_id)
+        if zone and boss then
+            return "|cffcfcfcf" .. tostring(zone) .. "|r\n|cffffd000" .. tostring(boss) .. "|r"
+        end
+    end
+    return ""
+end
+
+
+local function GetChecklistUnderItemText(item_id)
+    -- Checklist mode: compact text under icons
+    if not item_id or item_id <= 0 then return "" end
+
+    local name, _, quality = GetItemInfo(item_id)
+    if not name then
+        if QueuePreload then QueuePreload(item_id) end
+        name = "Item " .. tostring(item_id)
+        quality = 1
+    end
+
+    local zone, boss = nil, nil
+    if _G.BistooltipAddon and _G.BistooltipAddon.GetItemSourceInfo then
+        zone, boss = _G.BistooltipAddon:GetItemSourceInfo(item_id)
+    end
+
+    -- Funkcja pomocnicza do bezpiecznego ucinania zbyt długich nazw
+    local function smartTrunc(s, limit)
+        if not s then return "" end
+        if string.len(s) > limit then
+            return string.sub(s, 1, limit) .. ".."
+        end
+        return s
+    end
+
+    -- 1. Nazwa przedmiotu (Kolor Jakości)
+    local r, g, b = GetItemQualityColor(quality or 1)
+    local hexColor = string.format("ff%02x%02x%02x", r*255, g*255, b*255)
+    
+    -- Ucinamy nazwę trochę mniej agresywnie (do 18 znaków), żeby zmieściła się w kolumnie
+    local styledName = "|c" .. hexColor .. smartTrunc(name, 18) .. "|r"
+
+    -- 2. Boss (Szary, mniejszy, pod spodem)
+    local styledBoss = ""
+    if boss and boss ~= "" then
+        -- Bossów ucinamy mocniej, bo są mniej ważni w tym widoku
+        styledBoss = "\n|cffaaaaaa" .. smartTrunc(boss, 15) .. "|r"
+    end
+
+    return styledName .. styledBoss
+end
+
+
+
+-- ============================================================
+-- BIS checklist side panel (GRAPHICAL UI)
+-- ============================================================
+local checklistPanel = nil
+local checklistContainer = nil -- Kontener na widgety
+
+local function EnsureChecklistPanel()
+    if not main_frame or not main_frame.frame then return end
+    if checklistPanel then return end
+
+    -- Główne tło panelu
+    checklistPanel = CreateFrame("Frame", "BistooltipChecklistPanel", main_frame.frame)
+    checklistPanel:SetPoint("TOPLEFT", main_frame.frame, "TOPRIGHT", 5, 0)
+    checklistPanel:SetPoint("BOTTOMLEFT", main_frame.frame, "BOTTOMRIGHT", 5, 0)
+    checklistPanel:SetWidth(330) -- Szerokość panelu bocznego
+    checklistPanel:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 24,
+        insets = { left = 5, right = 5, top = 5, bottom = 5 }
+    })
+    checklistPanel:Hide()
+
+    -- Tytuł
+    local title = checklistPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+    title:SetPoint("TOP", 0, -15)
+    title:SetText("|cffffd100BIS CHECKLIST|r")
+    
+    -- ScrollFrame (Kontener przewijany)
+    checklistContainer = AceGUI:Create("ScrollFrame")
+    checklistContainer:SetLayout("List") -- Układ lista pod listą
+    checklistContainer:SetWidth(310)
+    checklistContainer:SetHeight(0) -- Dopasuje się
+    
+    -- Musimy ręcznie osadzić ramkę AceGUI w naszym panelu WoW
+    checklistContainer.frame:SetParent(checklistPanel)
+    checklistContainer.frame:SetPoint("TOPLEFT", 15, -45)
+    checklistContainer.frame:SetPoint("BOTTOMRIGHT", -15, 15)
+    checklistContainer.frame:Show()
+
+    checklistPanel._container = checklistContainer
+end
+
+local function DestroyChecklistPanel()
+    if checklistPanel then
+        checklistPanel:Hide()
+        checklistPanel:SetParent(nil)
+    end
+    checklistPanel = nil
+    checklistContainer = nil
+end
+
+local function TruncText(s, maxlen)
+    s = s and tostring(s) or ""
+    if maxlen and maxlen > 3 and string.len(s) > maxlen then
+        return string.sub(s, 1, maxlen - 1) .. "…"
+    end
+    return s
+end
+
+local function BuildChecklistGroups()
+    -- groups[zone][boss] = { items = { {id,name,slot}... } }
+    local groups = {}
+    local totalMissing = 0
+
+    if not (class and spec and phase) then
+        return groups, totalMissing
+    end
+
+    local slots = Bistooltip_bislists
+        and Bistooltip_bislists[class]
+        and Bistooltip_bislists[class][spec]
+        and Bistooltip_bislists[class][spec][phase]
+
+    if type(slots) ~= "table" then
+        return groups, totalMissing
+    end
+
+    for _, slot in ipairs(slots) do
+        local req = GetRequiredBISItemsForSlot(slot)
+        for _, id in ipairs(req) do
+            if id and id > 0 and OwnedCount(id) < 1 then
+                totalMissing = totalMissing + 1
+
+                local zone, boss = nil, nil
+                if _G.BistooltipAddon and _G.BistooltipAddon.GetItemSourceInfo then
+                    zone, boss = _G.BistooltipAddon:GetItemSourceInfo(id)
+                end
+                zone = zone or "Unknown instance"
+                boss = boss or "Unknown boss"
+
+                groups[zone] = groups[zone] or {}
+                groups[zone][boss] = groups[zone][boss] or { items = {} }
+
+                local name = GetItemInfo(id)
+                if not name then
+                    if QueuePreload then QueuePreload(id) end
+                    name = "Item " .. tostring(id)
+                end
+
+                table.insert(groups[zone][boss].items, {
+                    id = id,
+                    name = name,
+                    slot = slot.slot_name or "",
+                })
+            end
+        end
+    end
+
+    -- Sort items within each boss
+    for _, bosses in pairs(groups) do
+        for _, row in pairs(bosses) do
+            if row and row.items then
+                table.sort(row.items, function(a, b)
+                    if a.slot ~= b.slot then return tostring(a.slot) < tostring(b.slot) end
+                    return tostring(a.name) < tostring(b.name)
+                end)
+            end
+        end
+    end
+
+    return groups, totalMissing
+end
+
+-- ============================================================
+-- GRAPHICAL CHECKLIST RENDERERS (Modern UI)
+-- ============================================================
+
+-- Rysuje nagłówek bossa (Czerwony, duży, wyśrodkowany)
+local function DrawBossHeaderGUI(container, bossName, instanceName)
+    local group = AceGUI:Create("SimpleGroup")
+    group:SetLayout("Flow")
+    group:SetFullWidth(true)
+
+    local label = AceGUI:Create("Label")
+    label:SetFont("Fonts\\FRIZQT__.TTF", 14, "OUTLINE")
+    -- Formatowanie: Nazwa bossa na czerwno, instancja na szaro, wyśrodkowane
+    local text = string.format("\n|cffef5350%s|r\n|cff90a4ae%s|r", bossName:upper(), instanceName:gsub("[%(%)]", ""))
+    label:SetText(text)
+    label:SetJustifyH("CENTER")
+    label:SetFullWidth(true)
+    
+    group:AddChild(label)
+    container:AddChild(group)
+end
+
+-- Rysuje wiersz przedmiotu (Ikona po lewej, Schludny tekst po prawej)
+local function DrawItemRowGUI(container, item_id, slot_name)
+    local row = AceGUI:Create("SimpleGroup")
+    row:SetLayout("Flow") -- Pozwala układać elementy obok siebie
+    row:SetFullWidth(true)
+    
+    -- 1. Ikona (Duża, wyraźna)
+    local icon = AceGUI:Create("Icon")
+    icon:SetImageSize(28, 28) -- Zwiększony rozmiar ikony
+    icon:SetWidth(34)
+    local _, link, quality, _, _, _, _, _, _, texture = GetItemInfo(item_id)
+    
+    if not texture then 
+        texture = "Interface\\Icons\\Inv_misc_questionmark"
+        BistooltipAddon:ScanEquipment(true) -- Próba wymuszenia odświeżenia
+    end
+    icon:SetImage(texture)
+    
+    -- Interakcja: Kliknięcie ikony linkuje przedmiot w czacie
+    icon:SetCallback("OnClick", function()
+        if link then ChatEdit_InsertLink(link) end
+    end)
+    -- Tooltip po najechaniu
+    icon:SetCallback("OnEnter", function(widget)
+        GameTooltip:SetOwner(widget.frame, "ANCHOR_TOPRIGHT")
+        if link then GameTooltip:SetHyperlink(link) else GameTooltip:SetItemID(item_id) end
+        GameTooltip:Show()
+    end)
+    icon:SetCallback("OnLeave", function() GameTooltip:Hide() end)
+    
+    -- 2. Tekst (Slot na niebiesko, Nazwa w kolorze jakości, ID na szaro)
+    -- Używamy InteractiveLabel dla pewności klikalności
+    local label = AceGUI:Create("InteractiveLabel") 
+    label:SetFont("Fonts\\FRIZQT__.TTF", 11, "")
+    
+    local itemName = GetItemInfo(item_id) or ("loading " .. item_id)
+    
+    -- POPRAWKA KOLORÓW: Generujemy hex ręcznie, aby uniknąć błędu "|c|c..."
+    local r, g, b = GetItemQualityColor(quality or 1)
+    local colorHex = string.format("ff%02x%02x%02x", r * 255, g * 255, b * 255)
+    
+    -- Formatowanie HTML-like (AceGUI to obsługuje)
+    -- Linia 1: [SLOT] (Cyan)
+    -- Linia 2: Nazwa Przedmiotu (Kolor Rarity)
+    local text = string.format("|cff00ccff[%s]|r\n|c%s%s|r", 
+        slot_name:upper(),
+        colorHex, itemName
+    )
+    
+    label:SetText(text)
+    label:SetWidth(240) -- Reszta szerokości dla tekstu
+    
+    -- Interakcja na tekście też (dla wygody)
+    label:SetCallback("OnClick", function() if link then ChatEdit_InsertLink(link) end end)
+    label:SetCallback("OnEnter", function(widget)
+        GameTooltip:SetOwner(widget.frame, "ANCHOR_TOPRIGHT")
+        if link then GameTooltip:SetHyperlink(link) else GameTooltip:SetItemID(item_id) end
+        GameTooltip:Show()
+    end)
+    label:SetCallback("OnLeave", function() GameTooltip:Hide() end)
+
+    row:AddChild(icon)
+    row:AddChild(label)
+    
+    container:AddChild(row)
+end
+
+local function UpdateChecklistPanel()
+    if not bisChecklistMode then
+        if checklistPanel then checklistPanel:Hide() end
+        return
+    end
+    if not main_frame or not main_frame.frame or not main_frame.frame:IsShown() then return end
+
+    EnsureChecklistPanel()
+    if not checklistPanel or not checklistPanel._container then return end
+    checklistPanel:Show()
+    
+    -- Czyścimy stare elementy (ważne przy odświeżaniu!)
+    checklistPanel._container:ReleaseChildren()
+
+    local groups, totalMissing = BuildChecklistGroups()
+
+    -- 1. Nagłówek "Missing Items"
+    local headerGroup = AceGUI:Create("SimpleGroup")
+    headerGroup:SetFullWidth(true)
+    local headerLbl = AceGUI:Create("Label")
+    headerLbl:SetText(string.format("Items Missing: |cffffd100%d|r", totalMissing))
+    headerLbl:SetFont("Fonts\\FRIZQT__.TTF", 12)
+    headerLbl:SetColor(1,1,1)
+    headerLbl:SetJustifyH("CENTER")
+    headerGroup:AddChild(headerLbl)
+    checklistPanel._container:AddChild(headerGroup)
+
+    local zones = {}
+    for z in pairs(groups or {}) do table.insert(zones, z) end
+    table.sort(zones)
+
+    for _, z in ipairs(zones) do
+        local bosses = {}
+        for b in pairs(groups[z]) do table.insert(bosses, b) end
+        table.sort(bosses)
+
+        for _, b in ipairs(bosses) do
+            -- Używamy funkcji graficznej do rysowania bossa
+            DrawBossHeaderGUI(checklistPanel._container, b, z)
+            
+            local row = groups[z][b]
+            if row and row.items then
+                for _, it in ipairs(row.items) do
+                    -- Używamy funkcji graficznej do rysowania przedmiotu
+                    DrawItemRowGUI(checklistPanel._container, it.id, it.slot)
+                end
+            end
+        end
+    end
 end
 
 -- Background item preloader (small batch per tick)
@@ -148,20 +552,50 @@ local function createItemFrame(item_id, size, with_checkmark)
 
     item_frame:SetImage(itemIcon)
 
+
     if with_checkmark then
-        local checkMark = item_frame.frame:CreateTexture(nil, "OVERLAY")
-        checkMark:SetWidth(28)
-        checkMark:SetHeight(28)
-        checkMark:SetPoint("CENTER", 6, -8)
-        checkMark:SetTexture("Interface\\AddOns\\Bistooltip\\checkmark-16.tga")
-        -- Color differs: equipped = green, bags = yellow
+        -- High-visibility owned overlay:
+        --  - glowing border (equipped = green, bags = gold)
+        --  - bold ready-check mark with shadow
+        local texCheck  = "Interface\\RaidFrame\\ReadyCheck-Ready"
+        local texBorder = "Interface\\Buttons\\UI-ActionButton-Border"
+        local markSize  = math.max(18, math.floor(size * 0.60))
+        local borderSize = math.floor(size * 1.6)
+    
+        local border = item_frame.frame:CreateTexture(nil, "OVERLAY")
+        border:SetTexture(texBorder)
+        border:SetBlendMode("ADD")
+        border:SetPoint("CENTER", item_frame.frame, "CENTER", 0, 0)
+        border:SetWidth(borderSize)
+        border:SetHeight(borderSize)
+        border:SetTexCoord(0.13, 0.87, 0.13, 0.87)
+    
+        local shadow = item_frame.frame:CreateTexture(nil, "OVERLAY")
+        shadow:SetTexture(texCheck)
+        shadow:SetWidth(markSize)
+        shadow:SetHeight(markSize)
+        shadow:SetPoint("BOTTOMRIGHT", -2, 2)
+        shadow:SetVertexColor(0, 0, 0, 0.75)
+    
+        local mark = item_frame.frame:CreateTexture(nil, "OVERLAY")
+        mark:SetTexture(texCheck)
+        mark:SetWidth(markSize)
+        mark:SetHeight(markSize)
+        mark:SetPoint("BOTTOMRIGHT", -3, 3)
+    
         if with_checkmark == "equipped" then
-            checkMark:SetVertexColor(0.20, 1.00, 0.20, 0.95)
+            mark:SetVertexColor(0.20, 1.00, 0.20, 1.00)
+            border:SetVertexColor(0.20, 1.00, 0.20, 0.85)
         else
-            checkMark:SetVertexColor(1.00, 0.90, 0.10, 0.90)
+            mark:SetVertexColor(1.00, 0.85, 0.15, 1.00)
+            border:SetVertexColor(1.00, 0.85, 0.15, 0.85)
         end
-        table.insert(checkmarks, checkMark)
+    
+        table.insert(checkmarks, border)
+        table.insert(checkmarks, shadow)
+        table.insert(checkmarks, mark)
     end
+
 
     -- Small stack count overlay for bag copies
     if with_checkmark == "bags" then
@@ -310,20 +744,48 @@ local function drawItemSlot(slot)
             spec_frame:AddChild(AceGUI:Create("Label"))
         else
             local w = createItemFrame(item_id, 40, ownedState)
-            -- Dimming for owned (visual hierarchy)
-            if ownedState and w and w.frame then
-                w.frame:SetAlpha(0.55)
-                if ownedState == "equipped" then
-                    w.frame:SetAlpha(0.70)
-                end
-                -- Update stack count if present
-                if ownedState == "bags" and ownedCount > 1 and w.frame._bt_countText then
+            -- Stack count overlay (bags only)
+            if w and w.frame and w.frame._bt_countText then
+                if ownedState == "bags" and ownedCount > 1 then
                     w.frame._bt_countText:SetText(ownedCount)
-                elseif w.frame._bt_countText then
+                else
                     w.frame._bt_countText:SetText("")
                 end
             end
             spec_frame:AddChild(w)
+        end
+    end
+
+-- BIS checklist mode: show drop source under BIS slots (Top 1, and Top 2 for dual-slot items)
+-- BIS checklist mode: show drop source under BIS slots (Top 1, and Top 2 for dual-slot items)
+if bisChecklistMode then
+        local first = NormalizeItemID(slot and slot[1])
+        local dual = first and IsDualSlot(slot, first)
+
+        -- Dodajemy puste etykiety pod Slot i Enchanty (żeby zachować układ tabeli)
+        spec_frame:AddChild(AceGUI:Create("Label")) 
+        spec_frame:AddChild(AceGUI:Create("Label")) 
+
+        for col = 1, 6 do
+            local lbl = AceGUI:Create("Label")
+            
+            -- STYLIZACJA:
+            -- 1. Czcionka: Friz Quadrata (klasyczna WoW), rozmiar 10 (czytelny w małym polu), OUTLINE (czarna obwódka)
+            lbl:SetFont("Fonts\\FRIZQT__.TTF", 10, "OUTLINE")
+            -- 2. Wyśrodkowanie: Tekst będzie idealnie pod ikoną
+            lbl:SetJustifyH("CENTER")
+            lbl:SetJustifyV("TOP")
+            
+            local txt = ""
+            if col == 1 then
+                txt = GetChecklistUnderItemText(first)
+            elseif col == 2 and dual then
+                local second = NormalizeItemID(slot and slot[2])
+                txt = GetChecklistUnderItemText(second)
+            end
+            
+            lbl:SetText(txt)
+            spec_frame:AddChild(lbl)
         end
     end
 end
@@ -364,7 +826,7 @@ local function clearBoeMarks()
     boemarks = {}
 end
 
-local function drawSpecData()
+drawSpecData = function()
     clearCheckMarks()
     clearBoeMarks()
     saveData()
@@ -405,10 +867,67 @@ local function drawSpecData()
 
     for i, slot in ipairs(slots) do
         if rowMatches(slot) then
-            drawItemSlot(slot)
+            if bisChecklistMode and SlotBISCompleted(slot) then
+                -- Slot is already completed (BIS owned) -> hide the whole line in checklist mode
+            else
+                drawItemSlot(slot)
+
+                -- Build "targets to snipe" summary (missing BIS items only)
+                if bisChecklistMode and checklistSummaryLabel then
+                    checklistSummaryLabel._bt_targets = checklistSummaryLabel._bt_targets or {}
+                    checklistSummaryLabel._bt_unknown = checklistSummaryLabel._bt_unknown or {}
+
+                    local function addTarget(item_id)
+                        if not item_id or item_id <= 0 then return end
+                        if _G.BistooltipAddon and _G.BistooltipAddon.GetItemSourceInfo then
+                            local zone, boss = _G.BistooltipAddon:GetItemSourceInfo(item_id)
+                            if zone and boss then
+                                local tz = checklistSummaryLabel._bt_targets
+                                tz[zone] = tz[zone] or {}
+                                local tb = tz[zone][boss]
+                                if not tb then
+                                    tb = { count = 0 }
+                                    tz[zone][boss] = tb
+                                end
+                                tb.count = (tb.count or 0) + 1
+                                return
+                            end
+                        end
+                        checklistSummaryLabel._bt_unknown[item_id] = true
+                    end
+
+                    local req = GetRequiredBISItemsForSlot(slot)
+                    if #req == 1 then
+                        if OwnedCount(req[1]) < 1 then addTarget(req[1]) end
+                    elseif #req >= 2 then
+                        if req[1] == req[2] then
+                            if OwnedCount(req[1]) < 2 then addTarget(req[1]) end
+                        else
+                            if OwnedCount(req[1]) < 1 then addTarget(req[1]) end
+                            if OwnedCount(req[2]) < 1 then addTarget(req[2]) end
+                        end
+                    end
+                end
+            end
         end
     end
+
+    -- Render checklist hint (full detail is in side panel)
+    if checklistSummaryLabel then
+        if not bisChecklistMode then
+            checklistSummaryLabel:SetText("")
+        else
+            checklistSummaryLabel:SetText("|cffffff00BIS checklist|r: sources are shown under Top1/Top2. See targets on the right panel.")
+        end
+        checklistSummaryLabel._bt_targets = nil
+        checklistSummaryLabel._bt_unknown = nil
+    end
+
+    -- Update checklist side panel
+    UpdateChecklistPanel()
 end
+
+
 
 
 local function buildClassDict()
@@ -574,9 +1093,9 @@ local function createSpecFrame()
         }, {
             width = 44
         }, {
-            width = 44
+            width = 58
         }, {
-            width = 44
+            width = 58
         }, {
             width = 44
         }, {
@@ -683,35 +1202,69 @@ function BistooltipAddon:initBislists()
 end
 
 
+
 function BistooltipAddon:createMainFrame()
     if main_frame then
         BistooltipAddon:closeMainFrame()
         return
     end
 
+    -- Restore UI modes from saved variables (if present)
+    if BistooltipAddon and BistooltipAddon.db and BistooltipAddon.db.char then
+        if BistooltipAddon.db.char.bis_checklist ~= nil then
+            bisChecklistMode = BistooltipAddon.db.char.bis_checklist and true or false
+        end
+    end
+
     main_frame = AceGUI:Create("Frame")
-    main_frame:SetWidth(450)
-    main_frame:SetHeight(550) -- Adjust the height here as needed
-    main_frame.frame:SetMinResize(450, 300)
-    main_frame.frame:SetMaxResize(800, 600)
+    main_frame:SetWidth(520)
+    main_frame:SetHeight(640)
+
+    main_frame.frame:SetMinResize(480, 360)
+    main_frame.frame:SetMaxResize(1000, 800)
+
+    -- ESC behavior: 1st ESC closes checklist panel (if open), 2nd ESC closes the main window
+    main_frame.frame:EnableKeyboard(true)
+    main_frame.frame:SetScript("OnKeyDown", function(_, key)
+        if key == "ESCAPE" then
+            if checklistPanel and checklistPanel:IsShown() then
+                checklistPanel:Hide()
+                if checklistContainer then checklistContainer:ReleaseChildren() end
+            else
+                main_frame:Hide()
+            end
+        end
+    end)
+
+    local statusFrame = nil
 
     main_frame:SetCallback("OnClose", function(widget)
+        if statusFrame then
+            statusFrame:SetScript("OnUpdate", nil)
+            statusFrame = nil
+        end
+
         clearCheckMarks()
         clearBoeMarks()
         spec_frame = nil
         items = {}
         spells = {}
+
+        DestroyChecklistPanel()
+
         AceGUI:Release(widget)
         main_frame = nil
+        checklistSummaryLabel = nil
     end)
+
     main_frame:SetLayout("List")
     main_frame:SetTitle(BistooltipAddon.AddonNameAndVersion)
     main_frame:SetStatusText(Bistooltip_source_to_url[BistooltipAddon.db.char["data_source"]])
 
     drawDropdowns()
     createSpecFrame()
-    drawSpecData()
-    -- Search + filters (premium UX)
+
+    -- Search + filters
     local searchGroup = AceGUI:Create("SimpleGroup")
     searchGroup:SetFullWidth(true)
     searchGroup:SetLayout("Flow")
@@ -736,26 +1289,65 @@ function BistooltipAddon:createMainFrame()
     end)
     searchGroup:AddChild(missingToggle)
 
+    local checklistToggle = AceGUI:Create("CheckBox")
+    checklistToggle:SetLabel("BIS checklist")
+    checklistToggle:SetWidth(120)
+    checklistToggle:SetValue(bisChecklistMode and true or false)
+    checklistToggle:SetCallback("OnValueChanged", function(_, _, val)
+        bisChecklistMode = val and true or false
+
+        -- Persist
+        if BistooltipAddon and BistooltipAddon.db and BistooltipAddon.db.char then
+            BistooltipAddon.db.char.bis_checklist = bisChecklistMode
+        end
+
+        -- Checklist mode takes priority over "Only missing" (mutual exclusion)
+        if bisChecklistMode then
+            showOnlyMissing = false
+            missingToggle:SetValue(false)
+            missingToggle:SetDisabled(true)
+        else
+            missingToggle:SetDisabled(false)
+            DestroyChecklistPanel()
+        end
+
+        drawSpecData()
+    end)
+    searchGroup:AddChild(checklistToggle)
+
+    if bisChecklistMode then
+        missingToggle:SetDisabled(true)
+        missingToggle:SetValue(false)
+        showOnlyMissing = false
+    end
+
     main_frame:AddChild(searchGroup)
 
+    -- Compact checklist hint (full details are in the right panel)
+    local checklistGroup = AceGUI:Create("SimpleGroup")
+    checklistGroup:SetFullWidth(true)
+    checklistGroup:SetLayout("Fill")
 
-    -- Create a container to hold the button and the note label
+    checklistSummaryLabel = AceGUI:Create("Label")
+    checklistSummaryLabel:SetFullWidth(true)
+    checklistSummaryLabel:SetFont("Fonts\\FRIZQT__.TTF", 11, "")
+    checklistSummaryLabel:SetText("")
+    checklistGroup:AddChild(checklistSummaryLabel)
+    main_frame:AddChild(checklistGroup)
+
+    -- Buttons container
     local buttonContainer = AceGUI:Create("SimpleGroup")
     buttonContainer:SetFullWidth(true)
     buttonContainer:SetLayout("Flow")
 
-    -- Create the reload button
     local reloadButton = AceGUI:Create("Button")
     reloadButton:SetText("Reload Data")
-    reloadButton:SetWidth(120) -- Set a reasonable width for the button
+    reloadButton:SetWidth(120)
     reloadButton:SetCallback("OnClick", function()
         BistooltipAddon:reloadData()
     end)
-
-    -- Add the button to the container first
     buttonContainer:AddChild(reloadButton)
 
-    -- Create the Discord button
     local discordButton = AceGUI:Create("Button")
     discordButton:SetText("Join our Discord")
     discordButton:SetWidth(140)
@@ -764,13 +1356,21 @@ function BistooltipAddon:createMainFrame()
     end)
     buttonContainer:AddChild(discordButton)
 
-    -- Create the status label
     local noteLabel = AceGUI:Create("Label")
     noteLabel:SetText("")
-    noteLabel:SetWidth(250) -- Adjust width to fit the note text
-
-    -- Set font size and font type
+    noteLabel:SetWidth(250)
     noteLabel:SetFont(GameFontNormal:GetFont(), 9)
+
+    local spacerLabel = AceGUI:Create("Label")
+    spacerLabel:SetWidth(20)
+    buttonContainer:AddChild(spacerLabel)
+    buttonContainer:AddChild(noteLabel)
+
+    noteLabel:SetHeight(reloadButton.frame:GetHeight())
+    noteLabel:SetFullWidth(false)
+    if noteLabel.label and noteLabel.label.SetPoint then
+        noteLabel.label:SetPoint("BOTTOM")
+    end
 
     local function UpdateStatusText()
         local ds = (_G.DataStore_Inventory and "ON") or "OFF"
@@ -785,36 +1385,19 @@ function BistooltipAddon:createMainFrame()
         noteLabel:SetText(s)
     end
 
-    -- Keep status updated while frame is open
-    local statusFrame = CreateFrame("Frame", nil, main_frame.frame)
-    statusFrame:SetScript("OnUpdate", function(_, e)
+    statusFrame = CreateFrame("Frame", nil, main_frame.frame)
+    statusFrame:SetScript("OnUpdate", function()
         UpdateStatusText()
     end)
 
-    -- Create a spacer label to act as left margin
-    local spacerLabel = AceGUI:Create("Label")
-    spacerLabel:SetWidth(20) -- This sets the margin between button and label
-    buttonContainer:AddChild(spacerLabel)
-
-    -- Add the status label to the container
-    buttonContainer:AddChild(noteLabel)
-
-    -- Set the height of the noteLabel and align its text to the bottom
-    noteLabel:SetHeight(reloadButton.frame:GetHeight())
-    noteLabel:SetFullWidth(false)
-    -- noteLabel:SetJustifyH("LEFT")
-
-    -- Adjust the noteLabel's text frame to position it at the bottom
-    noteLabel.label:SetPoint("BOTTOM")
-
-    -- Add some space before the container to ensure it's at the bottom
     local spacer = AceGUI:Create("Label")
     spacer:SetFullWidth(true)
     spacer:SetText(" ")
-
-    -- Add the spacer and button container to the main frame
     main_frame:AddChild(spacer)
     main_frame:AddChild(buttonContainer)
+
+    -- Initial draw (after UI elements exist)
+    drawSpecData()
 end
 
 function BistooltipAddon:closeMainFrame()
@@ -826,5 +1409,3 @@ function BistooltipAddon:closeMainFrame()
         phaseDropDown = nil
     end
 end
-
-

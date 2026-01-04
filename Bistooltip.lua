@@ -229,10 +229,13 @@ local function RankTagForSelf(rank)
     return "|cffff3b3bNO BIS|r"
   end
   if rank.kind == "BIS" then
-    return "|cff13f53bBIS|r"
+    return "|cff00ff00BIS|r"
+  end
+  if rank.kind == "BIS2" then
+    return "|cff009900BIS2|r"
   end
   if rank.kind == "ALT" then
-    return string.format("|cffff3b3bNO BIS|r |cffffa500[ALT %d]|r", rank.n or 0)
+    return string.format("|cffffa500[ALT %d]|r", rank.n or 0)
   end
   return "|cffff3b3bNO BIS|r"
 end
@@ -267,9 +270,32 @@ local function NormalizeDualSlotRank(itemId, className, specName, rank)
   return rank
 end
 
+
+-- Display helper: in dual-slot contexts (rings/trinkets + Fury DW weapons),
+-- treat ALT2 as BIS² in the phase string, using a darker green.
+local function FormatPhasesString(itemId, className, specName, phasesStr)
+  if not phasesStr then return phasesStr end
+  -- If the item is BIS in any phase, it cannot be BIS2 (you can't equip two identical unique items).
+  if phasesStr:find("BIS") then return phasesStr end
+  local _, _, _, _, _, _, _, _, equipLoc = GetItemInfo(itemId)
+  local isDual = (equipLoc == "INVTYPE_FINGER" or equipLoc == "INVTYPE_TRINKET")
+  if not isDual and tostring(className) == "Warrior" and tostring(specName) == "Fury" then
+    if equipLoc == "INVTYPE_WEAPON" or equipLoc == "INVTYPE_WEAPONMAINHAND" or equipLoc == "INVTYPE_WEAPONOFFHAND" then
+      isDual = true
+    end
+  end
+  if not isDual then return phasesStr end
+
+  local bis2Token = "|cff009900BIS2|r"
+  -- Replace ALT2 / alt 2 only (avoid ALT20 etc.)
+  local out = phasesStr:gsub("[Aa][Ll][Tt]%s*2%f[%D]", bis2Token)
+  return out
+end
+
 local function RankTag(rank)
   if not rank then return "|cffff3b3bNO BIS|r" end
-  if rank.kind == "BIS" then return "|cff13f53bBIS|r" end
+  if rank.kind == "BIS" then return "|cff00ff00BIS|r" end
+  if rank.kind == "BIS2" then return "|cff009900BIS2|r" end
   if rank.kind == "ALT" then return string.format("|cffffa500ALT %d|r", rank.n or 0) end
   return "|cffffff00FOUND|r"
 end
@@ -330,11 +356,7 @@ end
 local function specFiltered(class_name, spec_name)
     if specHighlighted(class_name, spec_name) then
         return false
-    end
-    if IsAltKeyDown() then
-        return false
-    end
-    if BistooltipAddon.db.char.filter_specs[class_name] then
+    elseif BistooltipAddon.db.char.filter_specs[class_name] then
         return not BistooltipAddon.db.char.filter_specs[class_name][spec_name]
     end
     return false
@@ -471,60 +493,87 @@ local function getDataStoreInventory()
     return nil
 end
 
-local function GetItemSource(itemId)
-    local source
+local function formatInstanceName(instance)
+    if not instance then return nil end
+    instance = tostring(instance)
+    local tmpInstance = string.lower(instance)
 
-    -- Function to replace specific instance names
-    local function formatInstanceName(instance)
-        -- Normalize instance name for comparison (if needed)
-        local tmpInstance = string.lower(instance)
-
-        -- Replace "The Obsidian Sanctum(Heroic)" with "The Obsidian Sanctum(25)"
-
-        if tmpInstance == "the obsidian sanctum (heroic)" then
-            instance = "The Obsidian Sanctum(25)"
-        elseif tmpInstance == "the eye of eternity (heroic)" then
-            instance = "The Eye Of Eternity (25)"
-        elseif tmpInstance == "naxxramas (heroic)" then
-            instance = "Naxxramas (25)"
-        elseif tmpInstance == "ulduar (heroic)" then
-            instance = "Ulduar (25)"
-        end
-
-        return instance
+    -- Normalize heroic labels to 25-man naming used in your data
+    if tmpInstance == "the obsidian sanctum (heroic)" then
+        instance = "The Obsidian Sanctum(25)"
+    elseif tmpInstance == "the eye of eternity (heroic)" then
+        instance = "The Eye Of Eternity (25)"
+    elseif tmpInstance == "naxxramas (heroic)" then
+        instance = "Naxxramas (25)"
+    elseif tmpInstance == "ulduar (heroic)" then
+        instance = "Ulduar (25)"
     end
 
-    -- First, check the lootTable (assuming lootTable is defined somewhere)
-    for zone, bosses in pairs(lootTable) do
-        for boss, items in pairs(bosses) do
-            if table.contains(items, itemId) then
-                local formattedZone = formatInstanceName(zone)
-                source = "|cFFFFFFFFSource:|r |cFF00FF00[" .. formattedZone .. "] - " .. boss .. "|r"
-                break
+    return instance
+end
+
+local function findSourceInLootTable(itemId)
+    local lt = rawget(_G, "lootTable")
+    if type(lt) ~= "table" then
+        -- some packs keep it as a plain global; also try local upvalue name
+        lt = type(lootTable) == "table" and lootTable or nil
+    end
+    if type(lt) ~= "table" then
+        return nil, nil
+    end
+
+    for zone, bosses in pairs(lt) do
+        if type(bosses) == "table" then
+            for boss, items in pairs(bosses) do
+                if type(items) == "table" then
+                    for k, v in pairs(items) do
+                        if k == itemId or v == itemId then
+                            return formatInstanceName(zone), boss
+                        end
+                    end
+                end
             end
         end
-        if source then
-            break
-        end
     end
 
-    -- If not found in lootTable, fallback to DataStore_Inventory (optional)
-    if not source then
+    return nil, nil
+end
+
+-- Public API used by Bislist (checklist/export): returns instance, boss.
+function BistooltipAddon:GetItemSourceInfo(itemId)
+    if not itemId then return nil, nil end
+
+    self._sourceCache = self._sourceCache or {}
+    local cached = self._sourceCache[itemId]
+    if cached then
+        return cached[1], cached[2]
+    end
+
+    local zone, boss = findSourceInLootTable(itemId)
+
+    if not zone then
         local DataStore_Inventory = getDataStoreInventory()
-        if not DataStore_Inventory or not DataStore_Inventory.GetSource then
-            return nil
-        end
-
-        local Instance, Boss = DataStore_Inventory:GetSource(itemId)
-        if Instance and Boss then
-            local formattedInstance = formatInstanceName(Instance)
-            source = "|cFFFFFFFFSource:|r |cFF00FF00[" .. formattedInstance .. "] - " .. Boss .. "|r"
-        else
-            return nil
+        if DataStore_Inventory and DataStore_Inventory.GetSource then
+            local Instance, Boss = DataStore_Inventory:GetSource(itemId)
+            if Instance and Boss then
+                zone, boss = formatInstanceName(Instance), Boss
+            end
         end
     end
 
-    return source
+    self._sourceCache[itemId] = { zone, boss }
+    return zone, boss
+end
+
+local function GetItemSource(itemId)
+    if not (BistooltipAddon and BistooltipAddon.GetItemSourceInfo) then
+        return nil
+    end
+    local zone, boss = BistooltipAddon:GetItemSourceInfo(itemId)
+    if zone and boss then
+        return "|cFFFFFFFFSource:|r |cFF00FF00[" .. tostring(zone) .. "] - " .. tostring(boss) .. "|r"
+    end
+    return nil
 end
 
 -- Owned-item helper (cache from Core.lua)
@@ -539,56 +588,65 @@ local function GetOwnedInfo(itemId)
     return bags, equipped
 end
 
+
 -- Function to handle item tooltip
 local function OnGameTooltipSetItem(tooltip)
-    -- print("Debug: OnGameTooltipSetItem called")
+    local shiftMode = IsShiftKeyDown() and true or false
     local ctrlDown  = IsControlKeyDown() and true or false
-    local shiftDown = IsShiftKeyDown() and true or false
-    -- If user enabled "show only with CTRL", still allow SHIFT summary view.
-    if BistooltipAddon.db.char.tooltip_with_ctrl and (not ctrlDown) and (not shiftDown) then
-        return
-    end
 
     local _, link = tooltip:GetItem()
-    if not link then
-        return
-    end
+    if not link then return end
 
-    local _, itemId, _, _, _, _, _, _, _, _, _, _, _, _ = strsplit(":", link)
-    itemId = tonumber(itemId)
+    local _, itemIdStr = strsplit(":", link)
+    local itemId = tonumber(itemIdStr)
+    if not itemId then return end
 
-    if not itemId then
-        return
-    end
-
-    
-
-    -- Your specialization first (fast read)
-    local pClass, pSpec = GetPlayerClassSpecKeys()
-    if pClass and pSpec then
-        tooltip:AddLine(" ", 1, 1, 0)
-        tooltip:AddLine("Your specialization:", 1, 1, 1)
-
-        local foundPhases = searchIDInBislistsClassSpec(Bistooltip_bislists, itemId, pClass, pSpec)
-        local icon = GetSpecIcon(pClass, pSpec)
-        local left = (icon and string.format("|T%s:16|t ", icon) or "") .. ColorizeByClass(pClass, pClass) .. " - " .. ColorizeByClass(pClass, tostring(pSpec))
-
-        if foundPhases then
-            local rank = ParseBestRankFromPhases(foundPhases)
-            tooltip:AddDoubleLine(left, RankTagForSelf(rank), 1, 1, 1, 1, 1, 1)
-            tooltip:AddDoubleLine("Where:", tostring(foundPhases), 1, 1, 1, 1, 1, 0)
+    -- Your specialization section (only for epic equippable items)
+local showSpec = false
+do
+    local _, _, quality, _, _, _, _, _, equipLoc = GetItemInfo(link)
+    if quality and quality >= 3 then
+        if type(_G.IsEquippableItem) == "function" then
+            local ok, eq = pcall(_G.IsEquippableItem, link)
+            if ok and eq then showSpec = true end
         else
-            tooltip:AddDoubleLine(left, "|cffff3b3bNO BIS|r", 1, 1, 1, 1, 1, 1)
+            if equipLoc and equipLoc ~= "" and equipLoc ~= "INVTYPE_NON_EQUIP" then
+                showSpec = true
+            end
         end
-        tooltip:AddLine(" ", 1, 1, 0)
     end
--- tooltip:AddDoubleLine("Spec Name", "Phase", 1, 1, 1, 1, 1, 1)
+end
 
+
+    if showSpec then
+        local pClass, pSpec = GetPlayerClassSpecKeys()
+        if pClass and pSpec then
+            tooltip:AddLine(" ", 1, 1, 0)
+            tooltip:AddLine("Your specialization:", 1, 1, 1)
+
+            local foundPhases = searchIDInBislistsClassSpec(Bistooltip_bislists, itemId, pClass, pSpec)
+            local icon = GetSpecIcon(pClass, pSpec)
+            local left = (icon and string.format("|T%s:16|t ", icon) or "")
+                .. ColorizeByClass(pClass, pClass)
+                .. " - "
+                .. ColorizeByClass(pClass, tostring(pSpec))
+
+            if foundPhases then
+                local rank = NormalizeDualSlotRank(itemId, pClass, pSpec, ParseBestRankFromPhases(foundPhases))
+                tooltip:AddDoubleLine(left, RankTagForSelf(rank), 1, 1, 1, 1, 1, 1)
+                tooltip:AddDoubleLine("Where:", tostring(FormatPhasesString(itemId, pClass, pSpec, foundPhases)), 1, 1, 1, 1, 1, 0)
+            else
+                tooltip:AddDoubleLine(left, "|cffff3b3bNO BIS|r", 1, 1, 1, 1, 1, 1)
+            end
+            tooltip:AddLine(" ", 1, 1, 0)
+        end
+    end
+
+    -- Collect all matching entries first (so we can sort / focus without losing data)
     local anyFound = false
     local entries = {}
     local classOrder = _G.Bistooltip_classes_indexes or {}
 
-    -- Collect all matching entries first (so we can sort / focus without hiding data by default).
     for class, specs in caseInsensitivePairs(Bistooltip_spec_icons) do
         for spec, icon in pairs(specs) do
             if spec ~= "classIcon" then
@@ -596,18 +654,19 @@ local function OnGameTooltipSetItem(tooltip)
                 if foundPhases then
                     anyFound = true
                     local rank = ParseBestRankFromPhases(foundPhases)
+                    local bisCount, bestAlt, earliestBisW, earliestAnyW, bestPhase = ParsePhaseStatsFromString(foundPhases)
+
                     table.insert(entries, {
                         class = class,
                         spec  = spec,
                         icon  = icon,
                         phases = foundPhases,
                         rank = rank,
-                        -- phase-aware stats (for better sort and SHIFT summary)
-                        bisCount = (select(1, ParsePhaseStatsFromString(foundPhases))),
-                        bestAlt  = (select(2, ParsePhaseStatsFromString(foundPhases))),
-                        earliestBisW = (select(3, ParsePhaseStatsFromString(foundPhases))),
-                        earliestAnyW = (select(4, ParsePhaseStatsFromString(foundPhases))),
-                        bestPhase = (select(5, ParsePhaseStatsFromString(foundPhases))),
+                        bisCount = bisCount,
+                        bestAlt  = bestAlt,
+                        earliestBisW = earliestBisW,
+                        earliestAnyW = earliestAnyW,
+                        bestPhase = bestPhase,
                         classIdx = tonumber(classOrder[class]) or 999,
                     })
                 end
@@ -615,37 +674,29 @@ local function OnGameTooltipSetItem(tooltip)
         end
     end
 
-    -- Sort entries (QoL): BIS first, then ALT1/ALT2..., then other matches; earlier phase first; class order next.
-    local function _rankWeight(r)
-        if not r then return 4, 99 end
-        if r.kind == "BIS" then return 0, 0 end
-        if r.kind == "ALT" then return 1, (tonumber(r.n) or 99) end
-        return 2, 99
+    -- Helper: rank allowlist for CTRL focus mode
+    local function isFocusRank(r)
+        if not r then return false end
+        if r.kind == "BIS" or r.kind == "BIS2" then return true end
+        if r.kind == "ALT" then
+            local n = tonumber(r.n) or 99
+            return n <= 2
+        end
+        return false
     end
 
-    table.sort(entries, function(a, b)
-        local wa, na = _rankWeight(a.rank)
-        local wb, nb = _rankWeight(b.rank)
-        if wa ~= wb then return wa < wb end
-        if na ~= nb then return na < nb end
+    -- Always show the hint line once we have any results
+    if anyFound then
+        tooltip:AddLine("|cffaaaaaaHold SHIFT for summary \194\183 Hold CTRL for focus|r")
+    end
 
-        local pa = (a.rank and a.rank.kind == "BIS") and (a.earliestBisW or 999) or (a.earliestAnyW or 999)
-        local pb = (b.rank and b.rank.kind == "BIS") and (b.earliestBisW or 999) or (b.earliestAnyW or 999)
-        if pa ~= pb then return pa < pb end
-
-        if (a.classIdx or 999) ~= (b.classIdx or 999) then return (a.classIdx or 999) < (b.classIdx or 999) end
-        if tostring(a.class) ~= tostring(b.class) then return tostring(a.class) < tostring(b.class) end
-        return tostring(a.spec) < tostring(b.spec)
-    end)
-
-    local shiftMode = IsShiftKeyDown() and true or false
-    if shiftMode then
+    -- SHIFT summary (compact)
+    if shiftMode and #entries > 0 then
         tooltip:AddLine(" ", 1, 1, 0)
         tooltip:AddLine("Summary (SHIFT):", 1, 1, 1)
 
-        -- Group entries by their best rank; keep full list logic elsewhere unchanged.
         local groupedBis, groupedBis2, groupedNo = {}, {}, {}
-        local altGroups = {} -- [n] = { ... }
+        local altGroups = {}
 
         for i = 1, #entries do
             local e = entries[i]
@@ -665,14 +716,25 @@ local function OnGameTooltipSetItem(tooltip)
             end
         end
 
+        local function entrySort(a, b)
+            if a.classIdx ~= b.classIdx then return a.classIdx < b.classIdx end
+            if a.class ~= b.class then return tostring(a.class) < tostring(b.class) end
+            return tostring(a.spec) < tostring(b.spec)
+        end
+        table.sort(groupedBis, entrySort)
+        table.sort(groupedBis2, entrySort)
+        table.sort(groupedNo, entrySort)
+        for n, list in pairs(altGroups) do
+            table.sort(list, entrySort)
+        end
+
         local function addWrapped(label, list, sep)
             if #list == 0 then return end
             sep = sep or " / "
             local maxPerLine = 3
             local idx = 1
-            local first = true
             local indent = string.rep(" ", 6)
-
+            local first = true
             while idx <= #list do
                 local chunk = {}
                 for j = 1, maxPerLine do
@@ -682,15 +744,18 @@ local function OnGameTooltipSetItem(tooltip)
                     idx = idx + 1
                 end
                 if #chunk > 0 then
-                    tooltip:AddLine((first and label or indent) .. table.concat(chunk, sep))
-                    first = false
+                    if first then
+                        tooltip:AddLine(label .. table.concat(chunk, sep))
+                        first = false
+                    else
+                        tooltip:AddLine(indent .. table.concat(chunk, sep))
+                    end
                 end
             end
         end
 
-        -- BIS: prioritize specs that are BIS in multiple phases (already handled in entries sort via bisCount)
         addWrapped("  |cff00ff00BIS:|r ", groupedBis, " / ")
-        addWrapped("  |cff00cc00BIS²:|r ", groupedBis2, " / ")
+        addWrapped("  |cff009900BIS2:|r ", groupedBis2, " / ")
 
         local alts = {}
         for n in pairs(altGroups) do table.insert(alts, n) end
@@ -700,33 +765,89 @@ local function OnGameTooltipSetItem(tooltip)
         end
 
         addWrapped("  |cffff3b3bNO BIS:|r ", groupedNo, " / ")
-
         return true
     end
 
-    -- CTRL focus mode: show "My spec + alternatives" (BIS / ALT1 / ALT2) without touching defaults.
+        -- Default view: full list (sorted) / CTRL focus view (filtered)
     local focusMode = (not shiftMode) and ctrlDown
-    if focusMode then
-        tooltip:AddLine(" ", 1, 1, 0)
-        tooltip:AddLine("Best for group (CTRL):", 1, 1, 1)
+
+    -- Rank ordering: BIS > BIS2 > ALT1 > ALT2 ... > NO BIS
+    local function RankWeight(r)
+        if not r then return 999 end
+        if r.kind == "BIS" then return 0 end
+        if r.kind == "BIS2" then return 1 end
+        if r.kind == "ALT" then return 10 + (tonumber(r.n) or 99) end
+        return 900
     end
 
-    if not shiftMode then
+    local buckets = {}
+    local classes = {}
+
     for i = 1, #entries do
         local e = entries[i]
-        if (not focusMode)
-           or (e.rank and (e.rank.kind == "BIS" or (e.rank.kind == "ALT" and (e.rank.n or 99) <= 2))) then
-            local iconString = e.icon and string.format("|T%s:18|t", e.icon) or ""
-            local classColored = ColorizeByClass(e.class, e.class)
-            local specColored  = ColorizeByClass(e.class, e.spec)
-            local lineText = string.format("%s %s - %s", iconString, classColored, specColored)
-            tooltip:AddDoubleLine(lineText, e.phases)
+        e._normRank = NormalizeDualSlotRank(itemId, e.class, e.spec, e.rank)
+        if (not focusMode) or isFocusRank(e._normRank) then
+            local c = e.class
+            local b = buckets[c]
+            if not b then
+                b = {
+                    class = c,
+                    classIdx = e.classIdx or 999,
+                    bestW = 999,
+                    bestPhaseW = 999,
+                    entries = {},
+                }
+                buckets[c] = b
+                table.insert(classes, b)
+            end
+
+            local w = RankWeight(e._normRank)
+            local pW = PhaseWeight(e.bestPhase)
+            if (w < b.bestW) or (w == b.bestW and pW < b.bestPhaseW) then
+                b.bestW = w
+                b.bestPhaseW = pW
+            end
+
+            table.insert(b.entries, e)
         end
     end
 
+    -- Sort classes by best rank available for this item, then by earliest phase, then by natural class order
+    table.sort(classes, function(a, b)
+        if a.bestW ~= b.bestW then return a.bestW < b.bestW end
+        if a.bestPhaseW ~= b.bestPhaseW then return a.bestPhaseW < b.bestPhaseW end
+        if a.classIdx ~= b.classIdx then return a.classIdx < b.classIdx end
+        return tostring(a.class) < tostring(b.class)
+    end)
+
+    -- Sort specs inside each class by rank, then phase, then name
+    local function specSort(a, b)
+        local wa, wb = RankWeight(a._normRank), RankWeight(b._normRank)
+        if wa ~= wb then return wa < wb end
+        local pa, pb = PhaseWeight(a.bestPhase), PhaseWeight(b.bestPhase)
+        if pa ~= pb then return pa < pb end
+        return tostring(a.spec) < tostring(b.spec)
+    end
+    for i = 1, #classes do
+        table.sort(classes[i].entries, specSort)
     end
 
-    -- if Bistooltip_char_equipment and Bistooltip_char_equipment[itemId] ~= nil then
+    if focusMode and #classes > 0 then
+        tooltip:AddLine("|cffaaaaaaFocus mode: BIS / BIS2 / ALT1 / ALT2|r")
+    end
+
+    for i = 1, #classes do
+        local b = classes[i]
+        tooltip:AddLine(ColorizeByClass(b.class, b.class))
+        for j = 1, #b.entries do
+            local e = b.entries[j]
+            local iconString = e.icon and string.format("|T%s:14|t ", e.icon) or ""
+            local leftText = "   " .. iconString .. ColorizeByClass(b.class, e.spec)
+            tooltip:AddDoubleLine(leftText, FormatPhasesString(itemId, e.class, e.spec, e.phases), 1, 1, 1, 1, 1, 0)
+        end
+    end
+
+    -- Owned info (TUTAJ POWINIEN BYĆ DALSZY CIĄG)
     local bags, equipped = GetOwnedInfo(itemId)
     if (bags > 0) or (equipped > 0) then
         tooltip:AddLine(" ", 1, 1, 0)
@@ -740,8 +861,6 @@ local function OnGameTooltipSetItem(tooltip)
             end
         end
     else
-        -- If DataStore is missing, show a gentle note ONCE per session.
-        -- We do not scan bank/alt containers in this mode.
         if anyFound and not getDataStoreInventory() and not BistooltipAddon._noDSNoteShown then
             BistooltipAddon._noDSNoteShown = true
             tooltip:AddLine(" ", 1, 1, 0)
@@ -749,13 +868,8 @@ local function OnGameTooltipSetItem(tooltip)
         end
     end
 
-    -- tooltip:AddLine(" ", 1, 1, 0)
-    -- tooltip:AddLine("Hold ALT to disable spec filtering", 0.6, 0.6, 0.6)
-
-    -- Fetch item source information
+    -- Item source
     local itemSource = GetItemSource(itemId)
-
-    -- Add item source information to tooltip if available
     if itemSource then
         tooltip:AddLine(" ", 1, 1, 0)
         tooltip:AddLine(itemSource, 1, 1, 1)
@@ -763,27 +877,29 @@ local function OnGameTooltipSetItem(tooltip)
     end
 end
 
+local function RefreshAnyTooltip(tt)
+    if not tt or not tt.GetItem then return end
+    local _, link = tt:GetItem()
+    if not link then return end
+    if BistooltipAddon._refreshing then return end
+    BistooltipAddon._refreshing = true
+    tt:ClearLines()
+    tt:SetHyperlink(link)
+    BistooltipAddon._refreshing = false
+end
+
 function BistooltipAddon:initBisTooltip()
     eventFrame:RegisterEvent("MODIFIER_STATE_CHANGED")
     eventFrame:SetScript("OnEvent", function(_, _, e_key)
-        -- We only care about modifier keys.
-        if e_key ~= "RALT" and e_key ~= "LALT" and e_key ~= "RCTRL" and e_key ~= "LCTRL" and e_key ~= "RSHIFT" and e_key ~= "LSHIFT" then
+        if e_key ~= "RCTRL" and e_key ~= "LCTRL" and e_key ~= "RSHIFT" and e_key ~= "LSHIFT" then
             return
         end
-
-        local function refreshTooltip(tt)
-            if not tt or not tt.IsShown or not tt:IsShown() then return end
-            local _, link = tt:GetItem()
-            if not link then return end
-            if BistooltipAddon._refreshing then return end
-            BistooltipAddon._refreshing = true
-            tt:ClearLines()
-            tt:SetHyperlink(link)
-            BistooltipAddon._refreshing = false
+        if GameTooltip and GameTooltip:IsShown() then
+            RefreshAnyTooltip(GameTooltip)
         end
-
-        refreshTooltip(GameTooltip)
-        refreshTooltip(ItemRefTooltip)
+        if ItemRefTooltip and ItemRefTooltip:IsShown() then
+            RefreshAnyTooltip(ItemRefTooltip)
+        end
     end)
 
     GameTooltip:HookScript("OnTooltipSetItem", OnGameTooltipSetItem)

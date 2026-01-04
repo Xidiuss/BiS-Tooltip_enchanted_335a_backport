@@ -134,8 +134,8 @@ function BistooltipAddon:OnInitialize()
     BistooltipAddon.AddonNameAndVersion = "Bis-Tooltip 3.3.5a backport by Silver [DisruptionAuras]"
     BistooltipAddon:initConfig()
     BistooltipAddon:addMapIcon()
-    BistooltipAddon:initBislists()
-    BistooltipAddon:initBisTooltip()
+    if BistooltipAddon.initBislists then BistooltipAddon:initBislists() end
+    if BistooltipAddon.initBisTooltip then BistooltipAddon:initBisTooltip() end
 
     -- Ensure we have an initial cache for "You have this item" lines.
     BistooltipAddon:ScanEquipment(true)
